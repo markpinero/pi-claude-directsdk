@@ -230,6 +230,8 @@ export class AdmissionRelay {
   onUpstreamResponseEnded: (() => void) | null = null;
   requestBodyBytes: number | null = null;
   upstreamConnectionReused: boolean | null = null;
+  /** Prompt-cache repair result for the forwarded body (see cacheFix). */
+  cacheFix: CacheFixResult | null = null;
 
   private server: Server;
   private readonly target: UpstreamTarget;
@@ -409,6 +411,11 @@ export class AdmissionRelay {
     }
 
     try {
+      if (process.env["DIRECTSDK_CACHE_FIX"] !== "0") {
+        const fixed = cacheFix(body);
+        this.cacheFix = fixed.result;
+        body = fixed.body;
+      }
       await this.forward(req, res, body);
     } catch (error) {
       this.failure = error instanceof Error ? error.name : String(error);
@@ -573,6 +580,83 @@ export class AdmissionRelay {
       upstream.end(body);
     });
   }
+}
+
+/**
+ * Prompt-cache repair. Each request runs a fresh CLI process, which attaches its
+ * per-session account reminder to the newest user message. Pi replays that message
+ * without it on the next request, so the cached prefix never extends past it, and
+ * the replay anchor one frame back re-caches the latest turn every time. Strip
+ * exactly that reminder and move the single replay anchor onto the newest user
+ * message, which is then replayed byte-identically. Disable: DIRECTSDK_CACHE_FIX=0.
+ */
+const ACCOUNT_REMINDER =
+  /\n?<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# userEmail\n[\s\S]*?<\/system-reminder>\n?/g;
+const REMINDER_HINT = "# userEmail";
+
+export type CacheFixResult = {
+  stripped: number;
+  /** The reminder hint survived stripping: the CLI wording likely changed. */
+  unmatched: boolean;
+};
+type Block = { type: string; text?: string; content?: unknown; cache_control?: unknown };
+
+function stripBlocks(blocks: Block[], count: { n: number }): Block[] {
+  const out: Block[] = [];
+  const strip = (text: string): string => text.replace(ACCOUNT_REMINDER, () => (count.n++, ""));
+  for (const block of blocks) {
+    if (block.type === "text" && typeof block.text === "string") {
+      const text = strip(block.text);
+      if (text !== "" || block.text === "") {
+        out.push({ ...block, text });
+        continue;
+      }
+      // A reminder-only block: the CLI also appended one newline to the block before it.
+      const prev = out.at(-1);
+      if (prev?.type === "text" && prev.text?.endsWith("\n")) {
+        out[out.length - 1] = { ...prev, text: prev.text.slice(0, -1) };
+      }
+      continue;
+    }
+    if (block.type === "tool_result") {
+      const c = block.content;
+      out.push({
+        ...block,
+        content: typeof c === "string" ? strip(c) : Array.isArray(c) ? stripBlocks(c as Block[], count) : c,
+      });
+      continue;
+    }
+    out.push(block);
+  }
+  return out;
+}
+
+export function cacheFix(body: Buffer): { body: Buffer; result: CacheFixResult | null } {
+  let request: { messages?: Array<{ role: string; content: unknown }> };
+  try {
+    request = JSON.parse(body.toString("utf8"));
+  } catch {
+    return { body, result: null };
+  }
+  if (!Array.isArray(request.messages)) return { body, result: null };
+  const count = { n: 0 };
+  let marker: unknown;
+  let lastUser: Block[] | undefined;
+  for (const message of request.messages) {
+    if (message.role !== "user") continue;
+    const content: Block[] =
+      typeof message.content === "string" ? [{ type: "text", text: message.content }] : (message.content as Block[]);
+    const blocks = stripBlocks(content, count).map(({ cache_control, ...block }) => {
+      if (cache_control) marker = cache_control;
+      return block as Block;
+    });
+    message.content = blocks;
+    if (blocks.length) lastUser = blocks;
+  }
+  const last = lastUser?.at(-1);
+  if (marker && last) last.cache_control = marker;
+  const out = JSON.stringify(request);
+  return { body: Buffer.from(out), result: { stripped: count.n, unmatched: out.includes(REMINDER_HINT) } };
 }
 
 function readBody(req: IncomingMessage, cap: number): Promise<Buffer> {
