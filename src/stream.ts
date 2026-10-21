@@ -216,6 +216,17 @@ interface PendingTool {
   json: string;
 }
 
+let cacheFixWarned = false;
+/** Once per process: the CLI reminder changed shape, so the cache repair silently stopped. */
+function warnCacheFixUnmatched(): void {
+  if (cacheFixWarned) return;
+  cacheFixWarned = true;
+  console.warn(
+    "Claude DirectSDK: the CLI account reminder was not recognized, so prompt-cache repair is inactive. " +
+      "Update ACCOUNT_REMINDER in src/admission.ts for this Claude Code version.",
+  );
+}
+
 export function streamClaudeDirectSdk(
   model: Model<Api>,
   context: TranscriptContext,
@@ -271,6 +282,7 @@ async function executeCall(
         nativeCostUsd,
         nativeCostNote: "estimate, not subscription charge",
         cliAvailable,
+        cacheFix: relay?.cacheFix ?? null,
         measurements: measurements.toJson(
           relay?.requestBodyBytes ?? null,
           relay?.capture.message?.usage,
@@ -705,6 +717,7 @@ async function executeCall(
     // Completion gate. Tool calls publish only after the first upstream
     // response is complete, usage and stop reason are captured, and the
     // child has exited.
+    if (relay.cacheFix?.unmatched) warnCacheFixUnmatched();
     const used = relay.used;
     let authoritative: NativeAssistantMessage;
     const soleResult = results[0];
